@@ -1,4 +1,4 @@
-# Model vijayvuyyuru:f1viz:f1viz
+# Model vijayvuyyuru:viz:f1viz
 
 Provide a description of the model and any relevant information.
 

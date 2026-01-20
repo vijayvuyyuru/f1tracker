@@ -35,11 +35,178 @@ type Location struct {
 	Z            int    `json:"z"`
 }
 
+// TrackPoint represents a point on the reference track
+type TrackPoint struct {
+	X int `json:"x"`
+	Y int `json:"y"`
+	Z int `json:"z"`
+}
+
+// ReferenceTrack contains 144 points representing the track layout (one per index 0-143)
+type ReferenceTrack struct {
+	StartPoint TrackPoint   `json:"start_point"`
+	Points     []TrackPoint `json:"points"` // 144 points, index 0-143
+}
+
 // distance2D calculates the 2D Euclidean distance between two points (ignoring Z)
 func distance2D(x1, y1, x2, y2 int) float64 {
 	dx := float64(x2 - x1)
 	dy := float64(y2 - y1)
 	return math.Sqrt(dx*dx + dy*dy)
+}
+
+// generateReferenceTrack creates a reference track with 144 points from location data
+// It extracts one complete lap and divides it into 144 evenly spaced segments
+func generateReferenceTrack(locations []Location, startPoint TrackPoint) (*ReferenceTrack, error) {
+	if len(locations) < 144 {
+		return nil, fmt.Errorf("need at least 144 locations to generate reference track")
+	}
+
+	// Find the first complete lap by detecting when we return close to the start point
+	startX := startPoint.X
+	startY := startPoint.Y
+	threshold := 1000.0 // Distance threshold to consider "close" to start
+
+	var lapEndIdx int = len(locations) - 1
+	for i := 100; i < len(locations); i++ {
+		dist := distance2D(locations[i].X, locations[i].Y, startX, startY)
+		if dist < threshold {
+			lapEndIdx = i
+			break
+		}
+	}
+
+	// Use the first complete lap
+	lapLocations := locations[0 : lapEndIdx+1]
+	if len(lapLocations) < 144 {
+		// If lap is shorter than 144 points, use all available points
+		lapLocations = locations
+	}
+
+	// Calculate cumulative distances along the lap
+	cumulativeDistances := make([]float64, len(lapLocations))
+	cumulativeDistances[0] = 0.0
+	var totalDist float64
+	for i := 1; i < len(lapLocations); i++ {
+		dist := distance2D(lapLocations[i-1].X, lapLocations[i-1].Y, lapLocations[i].X, lapLocations[i].Y)
+		totalDist += dist
+		cumulativeDistances[i] = totalDist
+	}
+
+	// Add distance from last point back to start point to close the loop
+	distToStart := distance2D(lapLocations[len(lapLocations)-1].X, lapLocations[len(lapLocations)-1].Y, startX, startY)
+	trackLength := totalDist + distToStart
+
+	// Create 144 evenly spaced points along the track
+	referencePoints := make([]TrackPoint, 144)
+
+	for i := 0; i < 144; i++ {
+		// Target distance for this index (0 to trackLength)
+		// For i=143, we want to be at trackLength (back to start)
+		targetDist := (float64(i) / 143.0) * trackLength
+
+		// Find the two points that bracket this distance
+		var point TrackPoint
+		if i == 0 || i == 143 {
+			// First and last points are always the start point to close the loop
+			point = TrackPoint{X: startX, Y: startY, Z: startPoint.Z}
+		} else {
+			// Interpolate between two points
+			found := false
+			for j := 0; j < len(cumulativeDistances)-1; j++ {
+				if cumulativeDistances[j] <= targetDist && cumulativeDistances[j+1] >= targetDist {
+					// Interpolate between points j and j+1
+					dist1 := cumulativeDistances[j]
+					dist2 := cumulativeDistances[j+1]
+					ratio := (targetDist - dist1) / (dist2 - dist1)
+
+					point = TrackPoint{
+						X: int(float64(lapLocations[j].X) + ratio*float64(lapLocations[j+1].X-lapLocations[j].X)),
+						Y: int(float64(lapLocations[j].Y) + ratio*float64(lapLocations[j+1].Y-lapLocations[j].Y)),
+						Z: int(float64(lapLocations[j].Z) + ratio*float64(lapLocations[j+1].Z-lapLocations[j].Z)),
+					}
+					found = true
+					break
+				}
+			}
+			// If target distance is beyond the last point, interpolate from last point to start
+			if !found && targetDist > cumulativeDistances[len(cumulativeDistances)-1] {
+				// Interpolate from last point to start point
+				dist1 := cumulativeDistances[len(cumulativeDistances)-1]
+				ratio := (targetDist - dist1) / distToStart
+
+				lastPoint := lapLocations[len(lapLocations)-1]
+				point = TrackPoint{
+					X: int(float64(lastPoint.X) + ratio*float64(startX-lastPoint.X)),
+					Y: int(float64(lastPoint.Y) + ratio*float64(startY-lastPoint.Y)),
+					Z: int(float64(lastPoint.Z) + ratio*float64(startPoint.Z-lastPoint.Z)),
+				}
+			}
+		}
+		referencePoints[i] = point
+	}
+
+	return &ReferenceTrack{
+		StartPoint: startPoint,
+		Points:     referencePoints,
+	}, nil
+}
+
+// mapLocationToIndex maps a single location to an index 0-143 using the reference track
+// Returns the index of the closest point on the reference track
+//
+// Production usage:
+//  1. Load reference track once at startup: track, err := loadReferenceTrack("reference_track.json")
+//  2. For each location, call: index := mapLocationToIndex(location, track)
+//  3. Index will be 0-143 representing position along the track
+func mapLocationToIndex(location Location, track *ReferenceTrack) int {
+	if len(track.Points) != 144 {
+		return 0
+	}
+
+	minDist := math.MaxFloat64
+	closestIdx := 0
+
+	// Find the closest point on the reference track
+	for i, refPoint := range track.Points {
+		dist := distance2D(location.X, location.Y, refPoint.X, refPoint.Y)
+		if dist < minDist {
+			minDist = dist
+			closestIdx = i
+		}
+	}
+
+	return closestIdx
+}
+
+// loadReferenceTrack loads a reference track from a JSON file
+func loadReferenceTrack(filename string) (*ReferenceTrack, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	var track ReferenceTrack
+	err = json.Unmarshal(data, &track)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(track.Points) != 144 {
+		return nil, fmt.Errorf("reference track must have exactly 144 points, got %d", len(track.Points))
+	}
+
+	return &track, nil
+}
+
+// saveReferenceTrack saves a reference track to a JSON file
+func saveReferenceTrack(track *ReferenceTrack, filename string) error {
+	data, err := json.MarshalIndent(track, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filename, data, 0644)
 }
 
 // mapLocationsToIndices maps locations to indices 0-143 based on cumulative distance along path
@@ -261,28 +428,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Write start point for index calculations to JSON file
+	// Generate and save reference track for production use
 	if len(locations) > 0 {
-		startPoint := Location{
-			X:            locations[0].X,
-			Y:            locations[0].Y,
-			Z:            locations[0].Z,
-			Date:         locations[0].Date,
-			DriverNumber: locations[0].DriverNumber,
-			MeetingKey:   locations[0].MeetingKey,
-			SessionKey:   locations[0].SessionKey,
+		startPoint := TrackPoint{
+			X: locations[0].X,
+			Y: locations[0].Y,
+			Z: locations[0].Z,
 		}
 
-		startPointJSON, err := json.MarshalIndent(startPoint, "", "  ")
+		// Generate reference track from location data
+		referenceTrack, err := generateReferenceTrack(locations, startPoint)
 		if err != nil {
-			fmt.Printf("Error marshaling start point: %v\n", err)
+			fmt.Printf("Error generating reference track: %v\n", err)
 		} else {
-			err = os.WriteFile("start_point.json", startPointJSON, 0644)
+			// Save reference track to JSON file
+			err = saveReferenceTrack(referenceTrack, "reference_track.json")
 			if err != nil {
-				fmt.Printf("Error writing start point to file: %v\n", err)
+				fmt.Printf("Error saving reference track: %v\n", err)
 			} else {
-				fmt.Printf("Start point written to start_point.json\n")
+				fmt.Printf("Reference track written to reference_track.json\n")
+				fmt.Printf("Reference track contains %d points (indices 0-143)\n", len(referenceTrack.Points))
 			}
+
+			// Draw reference track as pointcloud
+			drawReferenceTrack(referenceTrack)
 		}
 	}
 
@@ -335,6 +504,27 @@ func main() {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// Production usage example: Load reference track and map arbitrary locations
+	fmt.Println("\n=== Production Usage Example ===")
+	referenceTrack, err := loadReferenceTrack("reference_track.json")
+	if err != nil {
+		fmt.Printf("Could not load reference track: %v\n", err)
+		fmt.Println("(This is expected if reference_track.json doesn't exist yet)")
+	} else {
+		fmt.Println("Reference track loaded successfully")
+
+		// Draw reference track as pointcloud
+		drawReferenceTrack(referenceTrack)
+
+		// Example: Map a few locations to indices
+		if len(locations) > 0 {
+			fmt.Println("\nMapping sample locations to indices:")
+			for i := 0; i < len(locations) && i < 5; i++ {
+				idx := mapLocationToIndex(locations[i], referenceTrack)
+				fmt.Printf("Location %d: (%d, %d) -> Index %d\n", i, locations[i].X, locations[i].Y, idx)
+			}
+		}
+	}
 }
 
 func drawMap(locations []Location) {
@@ -344,4 +534,25 @@ func drawMap(locations []Location) {
 			pointcloud.NewColoredData(color.NRGBA{R: 0, G: 0, B: 0, A: 255}))
 	}
 	vizClient.DrawPointCloud("map", pc, nil)
+}
+
+// drawReferenceTrack reads the reference track and generates a pointcloud from it
+func drawReferenceTrack(track *ReferenceTrack) {
+	pc := pointcloud.NewBasicEmpty()
+
+	// Draw all 144 points from the reference track
+	for i, point := range track.Points {
+		// Color based on index: gradient from blue (0) to red (143)
+		r := uint8((i * 255) / 143)
+		b := uint8(255 - (i * 255 / 143))
+
+		pc.Set(r3.Vector{
+			X: float64(point.X),
+			Y: float64(point.Y),
+			Z: float64(point.Z),
+		}, pointcloud.NewColoredData(color.NRGBA{R: r, G: 0, B: b, A: 255}))
+	}
+
+	vizClient.DrawPointCloud("reference", pc, nil)
+	fmt.Println("Reference track pointcloud drawn with title 'reference'")
 }
