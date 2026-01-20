@@ -26,7 +26,7 @@ module.tar.gz: meta.json $(MODULE_BINARY)
 ifneq ($(VIAM_TARGET_OS), windows)
 	strip $(MODULE_BINARY)
 endif
-	tar czf $@ meta.json $(MODULE_BINARY)
+	tar czf $@ meta.json $(MODULE_BINARY) reference_track.json
 
 module: test module.tar.gz
 

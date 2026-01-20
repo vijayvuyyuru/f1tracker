@@ -3,16 +3,19 @@ package f1viz
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"image/color"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/golang/geo/r3"
+	vizClient "github.com/viam-labs/motion-tools/client/client"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/resource"
@@ -21,13 +24,24 @@ import (
 )
 
 var (
-	F1viz            = resource.NewModel("vijayvuyyuru", "viz", "f1viz")
-	errUnimplemented = errors.New("unimplemented")
-	startPoint       = r3.Vector{X: -641,
+	F1viz      = resource.NewModel("vijayvuyyuru", "viz", "f1viz")
+	startPoint = r3.Vector{X: -641,
 		Y: -922,
 		Z: 1303,
 	}
 )
+
+type TrackPoint struct {
+	X int `json:"x"`
+	Y int `json:"y"`
+	Z int `json:"z"`
+}
+
+// ReferenceTrack contains 144 points representing the track layout (one per index 0-143)
+type ReferenceTrack struct {
+	StartPoint TrackPoint   `json:"start_point"`
+	Points     []TrackPoint `json:"points"` // 144 points, index 0-143
+}
 
 const (
 	circuitKey  = 9
@@ -35,9 +49,10 @@ const (
 	// Channel buffer size - adjust based on render speed vs fetch speed
 	locationChannelBuffer = 500
 	// Time window for each API fetch (30 seconds)
-	fetchWindowDuration = 30 * time.Second
+	fetchWindowDuration = time.Minute
 	// Threshold to trigger next fetch when buffer drops below this percentage
 	bufferLowThreshold = 0.2
+	referenceTrackFile = "reference_track.json"
 )
 
 // Session represents a session from the OpenF1 API
@@ -96,10 +111,30 @@ type vizF1viz struct {
 	cancelCtx  context.Context
 	cancelFunc func()
 
+	referenceTrack ReferenceTrack
+
 	// For producer-consumer pattern
-	locationChan chan Location
-	workers      *utils.StoppableWorkers
-	started      atomic.Bool
+	locationChans []chan Location // One channel per driver
+	workers       *utils.StoppableWorkers
+	started       atomic.Bool
+
+	// Timestamp tracking
+	timestampData []RoundTimestamp
+	timestampMu   sync.Mutex
+	roundCounter  int64
+}
+
+// RoundTimestamp represents a single round of location data collection
+type RoundTimestamp struct {
+	Round     int64               `json:"round"`
+	Timestamp string              `json:"timestamp"` // When this round was collected
+	Drivers   map[int]DriverStamp `json:"drivers"`   // Driver number -> timestamp
+}
+
+// DriverStamp contains timestamp data for a single driver
+type DriverStamp struct {
+	DriverNumber int    `json:"driver_number"`
+	Timestamp    string `json:"timestamp"` // From Location.Date
 }
 
 func newVizF1viz(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -124,6 +159,12 @@ func NewF1viz(ctx context.Context, deps resource.Dependencies, name resource.Nam
 		cancelFunc: cancelFunc,
 		started:    atomic.Bool{},
 	}
+
+	referenceTrack, err := loadReferenceTrack()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load reference track: %w", err)
+	}
+	s.referenceTrack = referenceTrack
 	return s, nil
 }
 
@@ -138,27 +179,68 @@ func (s *vizF1viz) DoCommand(ctx context.Context, cmd map[string]interface{}) (m
 	}
 	switch commandKey {
 	case "draw_reference_track":
-		// referenceTrack, err := loadReferenceTrack("reference_track.json")
-		// if err != nil {
-		// 	return nil, err
-		// }
-		// drawReferenceTrack(referenceTrack)
-		return nil, nil
+		err := s.drawReferenceTrack()
+		if err != nil {
+			return nil, fmt.Errorf("failed to draw reference track: %w", err)
+		}
+		return map[string]interface{}{
+			"status": "success",
+		}, nil
 	case "start":
-		return s.start(ctx)
+		s.drawReferenceTrack()
+		return s.start(ctx, cmd[commandKey])
 	case "stop":
 		s.workers.Stop()
 		s.workers = utils.NewStoppableWorkers(s.cancelCtx)
+		// Write timestamps to disk
+		if err := s.writeTimestampsToDisk(); err != nil {
+			s.logger.Errorf("Failed to write timestamps to disk: %v", err)
+			return nil, err
+		}
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("unknown command: %s", commandKey)
 	}
 }
 
-func (s *vizF1viz) start(ctx context.Context) (map[string]interface{}, error) {
-	if s.started.CompareAndSwap(false, true) {
+func (s *vizF1viz) start(ctx context.Context, cmdValue interface{}) (map[string]interface{}, error) {
+	if !s.started.CompareAndSwap(false, true) {
 		return nil, fmt.Errorf("already started")
 	}
+
+	// Parse driver numbers from command
+	var driverNumbers []int
+
+	// Handle []int directly
+	if nums, ok := cmdValue.([]int); ok {
+		driverNumbers = nums
+	} else if nums, ok := cmdValue.([]interface{}); ok {
+		// Handle []interface{} from JSON parsing
+		driverNumbers = make([]int, 0, len(nums))
+		for i, v := range nums {
+			var num int
+			switch n := v.(type) {
+			case int:
+				num = n
+			case int64:
+				num = int(n)
+			case float64:
+				num = int(n)
+			default:
+				return nil, fmt.Errorf("start command: element at index %d is not a number, got %T", i, v)
+			}
+			driverNumbers = append(driverNumbers, num)
+		}
+	} else {
+		return nil, fmt.Errorf("start command expects a list of integers, got %T", cmdValue)
+	}
+
+	if len(driverNumbers) == 0 {
+		return nil, fmt.Errorf("start command requires at least one driver number")
+	}
+
+	s.logger.Infof("Starting with driver numbers: %v", driverNumbers)
+
 	// Fetch session first
 	session, err := s.fetchSession(ctx)
 	if err != nil {
@@ -175,37 +257,46 @@ func (s *vizF1viz) start(ctx context.Context) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("failed to parse session start time: %w", err)
 	}
 
-	// Create buffered channel for locations
-	s.locationChan = make(chan Location, locationChannelBuffer)
+	// Create buffered channel for each driver
+	s.locationChans = make([]chan Location, len(driverNumbers))
+	for i := range s.locationChans {
+		s.locationChans[i] = make(chan Location, locationChannelBuffer)
+	}
 
 	// Create StoppableWorkers using cancelCtx
 	s.workers = utils.NewStoppableWorkers(s.cancelCtx)
 
-	// Create fetcher state
-	state := &fetcherState{
-		sessionKey:      sessionKey,
-		lastFetchedTime: startTime,
-		driverNumber:    44, // Default driver, could be made configurable
-	}
+	// Create a fetcher worker for each driver
+	for i, driverNumber := range driverNumbers {
+		driverNum := driverNumber // Capture for closure
+		driverChan := s.locationChans[i]
 
-	s.logger.Infof("Starting fetcher for session %d, starting from %s", sessionKey, startTime.Format(time.RFC3339))
-
-	// Create fetcher worker with ticker (checks buffer and fetches every 1 second)
-	s.workers.Add(func(ctx context.Context) {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		defer close(s.locationChan)
-
-		for {
-			select {
-			case <-ctx.Done():
-				s.logger.Info("Fetcher cancelled")
-				return
-			case <-ticker.C:
-				s.fetcher(ctx, state)
-			}
+		// Create fetcher state for this driver
+		state := &fetcherState{
+			sessionKey:      sessionKey,
+			lastFetchedTime: startTime,
+			driverNumber:    driverNum,
 		}
-	})
+
+		s.logger.Infof("Starting fetcher for driver %d, session %d, starting from %s", driverNum, sessionKey, startTime.Format(time.RFC3339))
+
+		// Create fetcher worker with ticker (checks buffer and fetches every 1 second)
+		s.workers.Add(func(ctx context.Context) {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			defer close(driverChan)
+
+			for {
+				select {
+				case <-ctx.Done():
+					s.logger.Infof("Fetcher for driver %d cancelled", driverNum)
+					return
+				case <-ticker.C:
+					s.fetcher(ctx, state, driverChan)
+				}
+			}
+		})
+	}
 
 	// Create consumer worker
 	s.workers.Add(func(ctx context.Context) {
@@ -216,7 +307,7 @@ func (s *vizF1viz) start(ctx context.Context) (map[string]interface{}, error) {
 	// Return immediately - workers run in background
 	return map[string]interface{}{
 		"status":  "started",
-		"message": "Fetcher and consumer workers started",
+		"message": fmt.Sprintf("Fetcher and consumer workers started for %d drivers", len(driverNumbers)),
 	}, nil
 }
 
@@ -228,24 +319,23 @@ type fetcherState struct {
 }
 
 // fetcher is the work function called by the ticker-based fetcher worker
-func (s *vizF1viz) fetcher(ctx context.Context, state *fetcherState) {
+func (s *vizF1viz) fetcher(ctx context.Context, state *fetcherState, driverChan chan Location) {
 	// Check buffer level
-	bufferLevel := float64(len(s.locationChan)) / float64(cap(s.locationChan))
+	bufferLevel := float64(len(driverChan)) / float64(cap(driverChan))
 	if bufferLevel < bufferLowThreshold {
 		// Fetch next window
 		endTime := state.lastFetchedTime.Add(fetchWindowDuration)
 		locations, err := s.fetchLocationData(ctx, state.sessionKey, state.driverNumber, state.lastFetchedTime, endTime)
 		if err != nil {
-			s.logger.Errorf("Failed to fetch location data: %v", err)
+			s.logger.Errorf("Failed to fetch location data for driver %d: %v", state.driverNumber, err)
 			// Continue - don't exit on error, just retry next tick
 			return
 		}
 
 		if len(locations) == 0 {
-			// No more data available - stop the workers
-			s.logger.Info("No more location data available, closing channel and stopping workers")
-			close(s.locationChan)
-			s.workers.Stop()
+			// No more data available for this driver - close its channel
+			s.logger.Infof("No more location data available for driver %d, closing channel", state.driverNumber)
+			close(driverChan)
 			return
 		}
 
@@ -254,7 +344,7 @@ func (s *vizF1viz) fetcher(ctx context.Context, state *fetcherState) {
 			select {
 			case <-ctx.Done():
 				return
-			case s.locationChan <- loc:
+			case driverChan <- loc:
 				// Successfully sent
 			}
 		}
@@ -274,46 +364,102 @@ func (s *vizF1viz) fetcher(ctx context.Context, state *fetcherState) {
 			state.lastFetchedTime = endTime
 		}
 
-		s.logger.Debugf("Fetched %d locations, buffer level: %.2f%%", len(locations), bufferLevel*100)
+		s.logger.Debugf("Fetched %d locations for driver %d, buffer level: %.2f%%", len(locations), state.driverNumber, bufferLevel*100)
 	}
 }
 
-// consumer continuously consumes and renders location data
+// consumer continuously consumes and renders location data from all channels
 func (s *vizF1viz) consumer(ctx context.Context) {
-	s.logger.Info("Consumer started, waiting for location data...")
+	s.logger.Info("Consumer started, waiting for location data from all drivers...")
 
-	// Track locations for trail rendering
-	locationHistory := make([]Location, 0, 10)
+	// Track locations per driver for trail rendering
+	locationHistories := make(map[int][]Location)
 	trailLength := 5
 
-	for {
+	// Track which channels are still open
+	openChannels := make(map[int]bool)
+	for i := range s.locationChans {
+		openChannels[i] = true
+	}
+
+	// Outer loop: continue until all channels are closed
+	for len(openChannels) > 0 {
+		// Check for context cancellation
 		select {
 		case <-ctx.Done():
 			s.logger.Info("Consumer cancelled")
 			return
-		case location, ok := <-s.locationChan:
-			if !ok {
-				// Channel closed, no more data
-				s.logger.Info("Location channel closed, consumer stopping")
+		default:
+		}
+
+		// Collect one location from each open channel
+		currentLocations := make(map[int]Location)
+
+		// Iterate through each channel and read from it
+		for i, ch := range s.locationChans {
+			if !openChannels[i] {
+				continue
+			}
+
+			// Read from this channel (blocking)
+			select {
+			case <-ctx.Done():
+				s.logger.Info("Consumer cancelled")
 				return
+			case location, ok := <-ch:
+				if !ok {
+					// Channel closed for this driver
+					s.logger.Infof("Channel closed for driver index %d", i)
+					delete(openChannels, i)
+					continue
+				}
+				currentLocations[i] = location
+			}
+		}
+
+		// If we have locations from all open channels, render
+		if len(currentLocations) == len(openChannels) && len(currentLocations) > 0 {
+			// Record timestamps for this round
+			round := atomic.AddInt64(&s.roundCounter, 1)
+			roundTimestamp := RoundTimestamp{
+				Round:     round,
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Drivers:   make(map[int]DriverStamp),
+			}
+			for _, location := range currentLocations {
+				roundTimestamp.Drivers[location.DriverNumber] = DriverStamp{
+					DriverNumber: location.DriverNumber,
+					Timestamp:    location.Date,
+				}
 			}
 
-			// Add to history
-			locationHistory = append(locationHistory, location)
-			if len(locationHistory) > trailLength {
-				locationHistory = locationHistory[len(locationHistory)-trailLength:]
+			// Save timestamp data
+			s.timestampMu.Lock()
+			s.timestampData = append(s.timestampData, roundTimestamp)
+			s.timestampMu.Unlock()
+
+			// Update histories for all drivers
+			for _, location := range currentLocations {
+				history := locationHistories[location.DriverNumber]
+				history = append(history, location)
+				if len(history) > trailLength {
+					history = history[len(history)-trailLength:]
+				}
+				locationHistories[location.DriverNumber] = history
 			}
 
-			// Render the location with trail
-			if err := s.renderLocation(location, locationHistory); err != nil {
-				s.logger.Errorf("Failed to render location: %v", err)
+			// Render all locations as one pointcloud
+			if err := s.renderLocations(currentLocations, locationHistories); err != nil {
+				s.logger.Errorf("Failed to render locations: %v", err)
 				// Continue rendering even if one fails
 			}
 
-			// Small delay to control render rate (similar to original 10ms)
+			// Small delay to control render rate
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+
+	s.logger.Info("All channels closed, consumer stopping")
 }
 
 // fetchSession fetches session information from OpenF1 API
@@ -403,38 +549,62 @@ func (s *vizF1viz) fetchLocationData(ctx context.Context, sessionKey, driverNumb
 	return locations, nil
 }
 
-// renderLocation renders a single location with trail
-func (s *vizF1viz) renderLocation(location Location, history []Location) error {
+// renderLocations renders locations from all drivers as one pointcloud
+func (s *vizF1viz) renderLocations(currentLocations map[int]Location, locationHistories map[int][]Location) error {
 	pc := pointcloud.NewBasicEmpty()
 
-	// Render trail with fading intensity
-	for i, loc := range history {
-		// Calculate fade factor: most recent is 1.0, oldest fades to 0.0
-		fadeFactor := float64(i) / float64(len(history)-1)
-		if len(history) == 1 {
-			fadeFactor = 1.0
+	// Render each driver's current location and trail
+	for _, location := range currentLocations {
+		history := locationHistories[location.DriverNumber]
+
+		// Render trail with fading intensity
+		for i, loc := range history {
+			// Calculate fade factor: most recent is 1.0, oldest fades to 0.0
+			fadeFactor := float64(i) / float64(len(history)-1)
+			if len(history) == 1 {
+				fadeFactor = 1.0
+			}
+
+			// Color: different bright colors per driver, with fading
+			// Predefined palette of distinct bright colors for up to 10 drivers
+			driverColors := [][]uint8{
+				{255, 0, 0},     // Red
+				{0, 255, 0},     // Green
+				{0, 0, 255},     // Blue
+				{255, 255, 0},   // Yellow
+				{255, 0, 255},   // Magenta
+				{0, 255, 255},   // Cyan
+				{255, 128, 0},   // Orange
+				{128, 0, 255},   // Purple
+				{255, 192, 203}, // Pink
+				{0, 255, 128},   // Spring Green
+			}
+
+			driverIdx := location.DriverNumber % 10
+			baseColor := driverColors[driverIdx]
+
+			// Apply fade factor to make trail fade
+			r := uint8(float64(baseColor[0]) * fadeFactor)
+			g := uint8(float64(baseColor[1]) * fadeFactor)
+			b := uint8(float64(baseColor[2]) * fadeFactor)
+
+			pc.Set(r3.Vector{
+				X: float64(loc.X),
+				Y: float64(loc.Y),
+				Z: float64(loc.Z),
+			}, pointcloud.NewColoredData(color.NRGBA{R: r, G: g, B: b, A: 255}))
 		}
-
-		// Color: red channel fades
-		r := uint8(255 * fadeFactor)
-		g := uint8(0)
-		b := uint8(0)
-
-		pc.Set(r3.Vector{
-			X: float64(loc.X),
-			Y: float64(loc.Y),
-			Z: float64(loc.Z),
-		}, pointcloud.NewColoredData(color.NRGBA{R: r, G: g, B: b, A: 255}))
 	}
 
-	// Note: This assumes you have a way to draw pointclouds
-	// You may need to integrate with your visualization client here
-	// For now, we'll just log that we're rendering
-	s.logger.Debugf("Rendering location: (%d, %d, %d) with %d point trail",
-		location.X, location.Y, location.Z, len(history))
+	// Log rendering info
+	driverNums := make([]int, 0, len(currentLocations))
+	for _, loc := range currentLocations {
+		driverNums = append(driverNums, loc.DriverNumber)
+	}
+	s.logger.Debugf("Rendering pointcloud with %d drivers: %v", len(currentLocations), driverNums)
 
-	// TODO: Integrate with your visualization client
-	// Example: vizClient.DrawPointCloud("movement", pc, nil)
+	// Render the complete pointcloud
+	vizClient.DrawPointCloud("movement", pc, nil)
 
 	return nil
 }
@@ -444,5 +614,85 @@ func (s *vizF1viz) Close(context.Context) error {
 	if s.workers != nil {
 		s.workers.Stop()
 	}
+	// Write timestamps to disk on close
+	if err := s.writeTimestampsToDisk(); err != nil {
+		s.logger.Errorf("Failed to write timestamps to disk on close: %v", err)
+	}
 	return nil
+}
+
+// writeTimestampsToDisk writes the collected timestamp data to a JSON file
+func (s *vizF1viz) writeTimestampsToDisk() error {
+	s.timestampMu.Lock()
+	defer s.timestampMu.Unlock()
+
+	if len(s.timestampData) == 0 {
+		s.logger.Info("No timestamp data to write")
+		return nil
+	}
+
+	// Create filename with timestamp
+	filename := fmt.Sprintf("timestamps_%s.json", time.Now().UTC().Format("20060102_150405"))
+
+	data, err := json.MarshalIndent(s.timestampData, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal timestamp data: %w", err)
+	}
+
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		return fmt.Errorf("failed to write timestamp file: %w", err)
+	}
+
+	// Get absolute path for logging
+	absPath, err := filepath.Abs(filename)
+	if err != nil {
+		absPath = filename // Fallback to relative path if absolute fails
+	}
+
+	s.logger.Infof("Wrote %d rounds of timestamp data to %s", len(s.timestampData), absPath)
+
+	// Clear the data after writing
+	s.timestampData = nil
+	s.roundCounter = 0
+
+	return nil
+}
+
+// loadReferenceTrack loads a reference track from a JSON file
+func loadReferenceTrack() (ReferenceTrack, error) {
+	data, err := os.ReadFile(referenceTrackFile)
+	if err != nil {
+		return ReferenceTrack{}, err
+	}
+
+	var track ReferenceTrack
+	err = json.Unmarshal(data, &track)
+	if err != nil {
+		return ReferenceTrack{}, err
+	}
+
+	if len(track.Points) != 144 {
+		return ReferenceTrack{}, fmt.Errorf("reference track must have exactly 144 points, got %d", len(track.Points))
+	}
+
+	return track, nil
+}
+
+func (s *vizF1viz) drawReferenceTrack() error {
+	pc := pointcloud.NewBasicEmpty()
+
+	// Draw all 144 points from the reference track
+	for i, point := range s.referenceTrack.Points {
+		// Color based on index: gradient from blue (0) to red (143)
+		r := uint8((i * 255) / 143)
+		b := uint8(255 - (i * 255 / 143))
+
+		pc.Set(r3.Vector{
+			X: float64(point.X),
+			Y: float64(point.Y),
+			Z: float64(point.Z),
+		}, pointcloud.NewColoredData(color.NRGBA{R: r, G: 0, B: b, A: 255}))
+	}
+
+	return vizClient.DrawPointCloud("reference", pc, nil)
 }
